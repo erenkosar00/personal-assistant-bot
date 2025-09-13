@@ -1,7 +1,7 @@
 """
-Kişisel Telegram Asistan Botu v2.0
+Kişisel Telegram Asistan Botu v2.1 - Kararlı Sürüm
 - İnteraktif Butonlar & Komut Menüsü
-- Kapsamlı Kullanım Rehberi (/nasıl)
+- Kapsamlı Kullanım Rehberi (/nasil)
 - Gemini AI Sohbet & Kalıcı Hafıza
 """
 import os
@@ -27,9 +27,7 @@ if not GEMINI_API_KEY: raise ValueError("GEMINI_API_KEY ortam değişkeni ayarla
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
-# Her kullanıcı için sohbet oturumlarını saklayacak sözlük
 chat_sessions = {}
-
 DB_PATH = Path("assistant.db")
 TIMEZONE = pytz.timezone("Europe/Istanbul")
 
@@ -47,7 +45,7 @@ async def post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("start", "Asistanı başlatır"),
         BotCommand("help", "Hızlı yardım menüsünü gösterir"),
-        BotCommand("nasıl", "Detaylı kullanım kılavuzunu gösterir"),
+        BotCommand("nasil", "Detaylı kullanım kılavuzunu gösterir"), # <-- DÜZELTME
         BotCommand("yeni_sohbet", "Yapay zeka sohbet geçmişini sıfırlar"),
         BotCommand("gorev_ekle", "Yeni bir görev ekler"),
         BotCommand("gorevler", "Aktif görevleri butonlarla listeler"),
@@ -59,11 +57,9 @@ async def post_init(application: Application):
         BotCommand("hatirla", "Bota öğrettiğiniz bir bilgiyi sorar"),
     ])
 
+# --- ANA KOMUTLAR ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    start_text = ("🤖 Merhaba! Ben sizin kişisel asistanınızım.\n\n"
-                  "Artık sohbetlerimizi hatırlayabiliyorum. Görevlerinizi, notlarınızı ve hatırlatıcılarınızı yönetebilirim. "
-                  "Sohbet çubuğundaki / menüsünden tüm komutları görebilirsiniz.")
-    await update.message.reply_text(start_text)
+    await update.message.reply_text("🤖 Merhaba! Ben sizin kişisel asistanınızım.\nSohbet çubuğundaki / menüsünden komutları görebilirsiniz veya /nasil yazarak detaylı rehberi okuyabilirsiniz.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = ("🆘 HIZLI YARDIM\n\n"
@@ -72,10 +68,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  "▫️ /unutma [anahtar] [bilgi] ile bana bir şey öğret.\n"
                  "▫️ /hatirla [anahtar] ile öğrettiğin şeyi sor.\n"
                  "▫️ /yeni_sohbet ile sohbet hafızamı sıfırla.\n"
-                 "▫️ Detaylı rehber için /nasıl yaz.")
+                 "▫️ Detaylı rehber için /nasil yaz.") # <-- DÜZELTME
     await update.message.reply_text(help_text)
 
-async def nasil_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def nasil_command(update: Update, context: ContextTypes.DEFAULT_TYPE): # <-- DÜZELTME
     guide_text = """
 🤖 **Asistanını Nasıl Kullanırsın?**
 
@@ -136,19 +132,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
     cursor.execute('SELECT key, value FROM memories WHERE user_id = ?', (user_id,))
     memories = cursor.fetchall(); conn.close()
-
     long_term_memory_context = "\n".join([f"- {key}: {value}" for key, value in memories])
     system_prompt = f"Sen, sahibinin kişisel bir asistanısın. Sahibin hakkında bilmen gereken bazı özel bilgiler şunlar:\n{long_term_memory_context}\n\nBu bilgileri kullanarak kısa ve samimi cevaplar ver."
-
     if user_id not in chat_sessions:
         logger.info(f"Kullanıcı {user_id} için yeni sohbet oturumu oluşturuluyor.")
-        chat_sessions[user_id] = gemini_model.start_chat(history=[
-            {'role': 'user', 'parts': [system_prompt]},
-            {'role': 'model', 'parts': ["Anlaşıldı. Sahibim hakkında bu bilgileri hatırlayacağım ve ona göre davranacağım."]}
-        ])
-
+        chat_sessions[user_id] = gemini_model.start_chat(history=[{'role': 'user', 'parts': [system_prompt]},{'role': 'model', 'parts': ["Anlaşıldı. Sahibim hakkında bu bilgileri hatırlayacağım ve ona göre davranacağım."]}])
     chat_session = chat_sessions[user_id]
-
     try:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=constants.ChatAction.TYPING)
         response = await chat_session.send_message_async(user_text)
@@ -246,7 +235,7 @@ def main() -> None:
 
     application.add_handlers([
         CommandHandler("start", start_command), CommandHandler("help", help_command),
-        CommandHandler("nasıl", nasil_command), CommandHandler("yeni_sohbet", new_chat_command),
+        CommandHandler("nasil", nasil_command), CommandHandler("yeni_sohbet", new_chat_command), # <-- DÜZELTME
         CommandHandler("unutma", unutma_command), CommandHandler("hatirla", hatirla_command),
         CommandHandler("gorev_ekle", add_task_command), CommandHandler("gorevler", list_tasks_command),
         CommandHandler("not_ekle", add_note_command), CommandHandler("notlar", list_notes_command),
