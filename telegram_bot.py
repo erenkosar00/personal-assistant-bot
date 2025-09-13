@@ -1,5 +1,5 @@
 """
-Kişisel Telegram Asistan Botu v5.0 - Kararlı ve Akıllı Sürüm
+Kişisel Telegram Asistan Botu v5.1 - Gelişmiş Zaman Algılama
 """
 import os
 import logging
@@ -48,7 +48,7 @@ chat_sessions = {}
 async def post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("start", "Asistanı başlatır"),
-        BotCommand("hatirlat", "Google Takvime akıllı hatırlatıcı ekler"),
+        BotCommand("hatirlat", "Google Takvim'e akıllı hatırlatıcı ekler"),
         BotCommand("takvim", "Google Takvimini açar"),
         BotCommand("yeni_sohbet", "Yapay zeka sohbet geçmişini sıfırlar"),
     ])
@@ -58,26 +58,30 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Lütfen hatırlatıcı için bir zaman ve mesaj belirt.\nÖrnek: ")
+        await update.message.reply_text("Lütfen hatırlatıcı için bir zaman ve mesaj belirtin.\nÖrnek: ")
         return
 
     full_text = " ".join(context.args)
 
-    # Zamanı ve mesajı ayıran yeni, akıllı mantık
-    parsed_time = None
-    message = ""
-    for i in range(1, len(context.args) + 1):
-        time_candidate_str = " ".join(context.args[:i])
-        # Türkçe'yi ve 'de, 'da eklerini daha iyi anlaması için ayar
-        time_candidate = dateparser.parse(time_candidate_str, languages=['tr'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'Europe/Istanbul'})
-        if time_candidate:
-            parsed_time = time_candidate
-            message = " ".join(context.args[i:])
+    # --- YENİ VE GÜÇLÜ ZAMAN ALGILAMA MANTIĞI ---
+    # Cümlenin içindeki tarih/saat ifadelerini bulur
+    results = dateparser.search.search_dates(full_text, languages=['tr'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'Europe/Istanbul'})
 
-    if not parsed_time or not message:
-        await update.message.reply_text("Üzgünüm, zamanı veya mesajı ayırt edemedim. Lütfen 'yarın 15:30' veya '2 saat sonra' gibi bir ifadeyle başlayın.")
+    if not results:
+        await update.message.reply_text("Üzgünüm, cümlenin içinde bir zaman ifadesi bulamadım. Lütfen 'yarın 15:30' veya '2 saat sonra' gibi bir ifade kullan.")
         return
 
+    # Bulunan ilk zaman ifadesini ve tarih/saat nesnesini al
+    found_date_string, parsed_time = results[0]
+
+    # Mesajı, cümlenin içinden zaman ifadesini çıkararak bul
+    message = full_text.replace(found_date_string, "").strip()
+
+    if not message:
+        await update.message.reply_text("Hatırlatıcı için bir mesaj bulamadım. Lütfen zaman ifadesinden sonra neyi hatırlatacağımı da yaz.")
+        return
+
+    # Google Takvim için etkinliği oluştur
     event = {
         'summary': message,
         'start': {'dateTime': parsed_time.isoformat(), 'timeZone': 'Europe/Istanbul'},
