@@ -1,5 +1,5 @@
 """
-Kullanıcı Dostu Telegram Bot - Doğal Dil Destekli v6.0
+Kişisel Asistan Bot - Finansal Takip Sistemi v7.0
 """
 import os
 import logging
@@ -7,6 +7,7 @@ import base64
 import json
 import pytz
 import re
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from telegram import Update, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
@@ -44,37 +45,161 @@ genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
 chat_sessions = {}
 
-# --- INTENT TANIMLA ---
-def detect_intent(text):
-    """Kullanıcının mesajından ne istediğini anlar"""
+# --- FINANSAL VERİTABANI ---
+def init_financial_db():
+    """Finansal takip veritabanını başlat"""
+    db_path = Path.home() / ".telegram_assistant" / "financial.db"
+    os.makedirs(db_path.parent, exist_ok=True)
+    
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER,
+            account_type TEXT, -- 'araba', 'emlak', 'kisisel'
+            transaction_type TEXT, -- 'gelir', 'gider'
+            amount REAL,
+            category TEXT,
+            description TEXT,
+            date DATE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    return db_path
+
+DB_PATH = init_financial_db()
+
+# --- FİNANSAL İNTENT TANIMLAMA ---
+def detect_financial_intent(text):
+    """Finansal işlem tipini ve detaylarını tespit et"""
     text_lower = text.lower()
     
-    # Hatırlatıcı intent'i
-    reminder_keywords = ['hatırlat', 'randevu', 'toplantı', 'etkinlik', 'görüşme', 'buluşma', 'yapacak']
-    time_patterns = [r'\d{1,2}:\d{2}', r'yarın', r'bugün', r'saat', r'sonra', r'gün', r'hafta']
+    # Para miktarı tespiti
+    amount_match = re.search(r'(\d+(?:\.\d+)?)\s*tl', text_lower)
+    if not amount_match:
+        return None, None, None, None, None
     
-    has_reminder_keyword = any(keyword in text_lower for keyword in reminder_keywords)
-    has_time_pattern = any(re.search(pattern, text_lower) for pattern in time_patterns)
+    amount = float(amount_match.group(1))
     
-    if has_reminder_keyword or has_time_pattern:
-        return 'reminder', text
+    # İşlem tipi tespiti
+    income_keywords = ['kazandım', 'aldım', 'gelir', 'sattım', 'komisyon', 'ödeme aldım']
+    expense_keywords = ['harcadım', 'ödedim', 'aldım', 'masraf', 'gider', 'fatura']
     
-    # Takvim intent'i  
-    calendar_keywords = ['takvim', 'ajanda', 'program', 'etkinlik', 'görüşme', 'randevu']
-    if any(keyword in text_lower for keyword in calendar_keywords) and ('göster' in text_lower or 'aç' in text_lower):
-        return 'calendar', text
+    transaction_type = None
+    if any(keyword in text_lower for keyword in income_keywords):
+        transaction_type = 'gelir'
+    elif any(keyword in text_lower for keyword in expense_keywords):
+        transaction_type = 'gider'
+    else:
+        # Bağlama göre tahmin et
+        if any(word in text_lower for word in ['satış', 'komisyon', 'kazanç']):
+            transaction_type = 'gelir'
+        else:
+            transaction_type = 'gider'
+    
+    # Hesap tipi tespiti
+    account_type = 'kisisel'  # varsayılan
+    if any(word in text_lower for word in ['araba', 'galeri', 'otomobil', 'civic', 'bmw', 'mercedes']):
+        account_type = 'araba'
+    elif any(word in text_lower for word in ['emlak', 'ev', 'daire', 'kiralama', 'satış komisyonu']):
+        account_type = 'emlak'
+    
+    # Kategori tespiti
+    categories = {
+        'araba': {
+            'gelir': ['satış', 'servis', 'diğer'],
+            'gider': ['alım', 'yakıt', 'bakım', 'kira', 'personel', 'reklam', 'diğer']
+        },
+        'emlak': {
+            'gelir': ['satış_komisyonu', 'kiralama_komisyonu', 'danışmanlık', 'diğer'],
+            'gider': ['pazarlama', 'ulaşım', 'ofis', 'lisans', 'diğer']
+        },
+        'kisisel': {
+            'gelir': ['maaş', 'kira_geliri', 'yatırım', 'diğer'],
+            'gider': ['yemek', 'ulaşım', 'ev', 'eğlence', 'sağlık', 'alışveriş', 'diğer']
+        }
+    }
+    
+    category = 'diğer'  # varsayılan
+    
+    # Kategori tahmin et
+    for cat in categories[account_type][transaction_type]:
+        if cat in text_lower or any(word in text_lower for word in cat.split('_')):
+            category = cat
+            break
+    
+    # Açıklama çıkar (miktarı çıkararak)
+    description = re.sub(r'\d+(?:\.\d+)?\s*tl', '', text, flags=re.IGNORECASE).strip()
+    description = re.sub(r'\s+', ' ', description)
+    
+    return account_type, transaction_type, amount, category, description
+
+# --- FİNANSAL FONKSİYONLAR ---
+def add_transaction(user_id, account_type, transaction_type, amount, category, description):
+    """Finansal işlem ekle"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        INSERT INTO transactions (user_id, account_type, transaction_type, amount, category, description, date)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (user_id, account_type, transaction_type, amount, category, description, datetime.now().date()))
+    
+    conn.commit()
+    conn.close()
+
+def get_financial_summary(user_id, period='month', account_type=None):
+    """Finansal özet getir"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Tarih filtreleri
+    if period == 'day':
+        date_filter = datetime.now().date()
+        query_date = "date = ?"
+    elif period == 'week':
+        date_filter = (datetime.now() - timedelta(days=7)).date()
+        query_date = "date >= ?"
+    elif period == 'month':
+        date_filter = datetime.now().replace(day=1).date()
+        query_date = "date >= ?"
+    else:  # year
+        date_filter = datetime.now().replace(month=1, day=1).date()
+        query_date = "date >= ?"
+    
+    base_query = f"SELECT transaction_type, SUM(amount), category FROM transactions WHERE user_id = ? AND {query_date}"
+    params = [user_id, date_filter]
+    
+    if account_type:
+        base_query += " AND account_type = ?"
+        params.append(account_type)
+    
+    base_query += " GROUP BY transaction_type, category"
+    
+    cursor.execute(base_query, params)
+    results = cursor.fetchall()
+    
+    # Toplam gelir/gider hesapla
+    total_query = f"SELECT transaction_type, SUM(amount) FROM transactions WHERE user_id = ? AND {query_date}"
+    total_params = [user_id, date_filter]
+    
+    if account_type:
+        total_query += " AND account_type = ?"
+        total_params.append(account_type)
         
-    # Chat reset intent'i
-    reset_keywords = ['yeni konuşma', 'sıfırla', 'temizle', 'baştan', 'reset']
-    if any(keyword in text_lower for keyword in reset_keywords):
-        return 'reset_chat', text
-        
-    # Yardım intent'i
-    help_keywords = ['yardım', 'help', 'nasıl', 'komut', 'ne yapabilir']
-    if any(keyword in text_lower for keyword in help_keywords):
-        return 'help', text
-        
-    return 'chat', text
+    total_query += " GROUP BY transaction_type"
+    
+    cursor.execute(total_query, total_params)
+    totals = cursor.fetchall()
+    
+    conn.close()
+    
+    return results, totals
 
 # --- ZAMAN AYRIŞTIRMA FONKSİYONU ---
 def parse_time_from_text(text):
@@ -116,67 +241,188 @@ def parse_time_from_text(text):
     
     return None, text, None
 
+# --- İNTENT TANIMLAMA ---
+def detect_intent(text):
+    """Kullanıcının mesajından ne istediğini anlar"""
+    text_lower = text.lower()
+    
+    # Finansal işlem kontrolü
+    if re.search(r'\d+(?:\.\d+)?\s*tl', text_lower):
+        return 'financial', text
+    
+    # Finansal rapor kontrolü
+    report_keywords = ['ne kadar', 'toplam', 'özet', 'rapor', 'durum', 'hesap']
+    period_keywords = ['bugün', 'bu hafta', 'bu ay', 'bu yıl']
+    account_keywords = ['araba', 'emlak', 'kişisel', 'genel']
+    
+    if any(keyword in text_lower for keyword in report_keywords):
+        return 'financial_report', text
+    
+    # Hatırlatıcı intent'i
+    reminder_keywords = ['hatırlat', 'randevu', 'toplantı', 'etkinlik', 'görüşme', 'buluşma', 'yapacak']
+    time_patterns = [r'\d{1,2}:\d{2}', r'yarın', r'bugün', r'saat', r'sonra', r'gün', r'hafta']
+    
+    has_reminder_keyword = any(keyword in text_lower for keyword in reminder_keywords)
+    has_time_pattern = any(re.search(pattern, text_lower) for pattern in time_patterns)
+    
+    if has_reminder_keyword or has_time_pattern:
+        return 'reminder', text
+    
+    # Diğer intent'ler
+    calendar_keywords = ['takvim', 'ajanda', 'program']
+    if any(keyword in text_lower for keyword in calendar_keywords):
+        return 'calendar', text
+        
+    reset_keywords = ['yeni konuşma', 'sıfırla', 'temizle', 'baştan', 'reset']
+    if any(keyword in text_lower for keyword in reset_keywords):
+        return 'reset_chat', text
+        
+    help_keywords = ['yardım', 'help', 'nasıl', 'komut', 'ne yapabilir']
+    if any(keyword in text_lower for keyword in help_keywords):
+        return 'help', text
+        
+    return 'chat', text
+
 # --- TELEGRAM FONKSİYONLARI ---
 async def post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("start", "Asistanı başlatır"),
         BotCommand("yardim", "Yardım menüsünü gösterir"),
+        BotCommand("hesap", "Mali durum özeti"),
     ])
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("📅 Takvimimi Aç", callback_data="calendar")],
+        [InlineKeyboardButton("💰 Mali Durum", callback_data="financial_summary")],
+        [InlineKeyboardButton("📅 Takvim", callback_data="calendar")],
         [InlineKeyboardButton("💭 Yeni Sohbet", callback_data="new_chat")],
         [InlineKeyboardButton("❓ Yardım", callback_data="help")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        "🤖 Merhaba! Ben senin kişisel asistanınım.\n\n"
-        "Bana doğal dilden şöyle yazabilirsin:\n"
-        "• \"Yarın saat 14:30'da doktor randevum var\"\n"
-        "• \"Bugün 18:00'de spor yapacağım\"\n"
-        "• \"2 saat sonra alışveriş yapmayı hatırlat\"\n"
-        "• \"Takvimimi göster\"\n"
-        "• \"Yeni konuşma başlat\"\n\n"
-        "Komut yazmana gerek yok, sadece normal konuş!",
+        "🤖 Merhaba! Ben senin kişisel asistanın ve mali danışmanınım.\n\n"
+        "Bana şöyle yazabilirsin:\n"
+        "💰 \"5000 TL araba sattım\"\n"
+        "💰 \"300 TL yakıt aldım\"\n"
+        "💰 \"Bu ay ne kadar kazandım?\"\n"
+        "⏰ \"Yarın 14:30'da toplantım var\"\n"
+        "📅 \"Takvimimi göster\"\n\n"
+        "Komut yazmana gerek yok!",
         reply_markup=reply_markup
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def account_summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mali durum özeti komutu"""
+    await handle_financial_report(update, "bu ay genel durum")
+
+async def handle_financial_transaction(update: Update, text: str):
+    """Finansal işlem ekleme"""
+    user_id = update.effective_user.id
+    
+    result = detect_financial_intent(text)
+    if not result[0]:
+        await update.message.reply_text(
+            "💰 Para miktarını anlayamadım. Örnek:\n"
+            "\"5000 TL araba sattım\"\n"
+            "\"300 TL benzin aldım\""
+        )
+        return
+    
+    account_type, transaction_type, amount, category, description = result
+    
+    # İşlemi kaydet
+    add_transaction(user_id, account_type, transaction_type, amount, category, description)
+    
+    # Onay mesajı
+    account_names = {'araba': 'Araba İşi', 'emlak': 'Emlak İşi', 'kisisel': 'Kişisel'}
+    type_emoji = '📈' if transaction_type == 'gelir' else '📉'
+    
     await update.message.reply_text(
-        "🆘 Yardım Menüsü\n\n"
-        "Ben doğal dili anlıyorum! Şöyle yazabilirsin:\n\n"
-        "⏰ Hatırlatıcı için:\n"
-        "• \"Yarın 10:30'da toplantım var\"\n" 
-        "• \"Bugün 18:00'de spor yapacağım\"\n"
-        "• \"2 saat sonra ilaç almayı hatırlat\"\n"
-        "• \"Yarın 9'da kahvaltı randevusu\"\n\n"
-        "📅 Takvim için:\n"
-        "• \"Takvimimi göster\"\n"
-        "• \"Ajandamı aç\"\n\n"
-        "💭 Sohbet için:\n"
-        "• \"Yeni konuşma başlat\"\n"
-        "• \"Sohbet geçmişini sıfırla\"\n\n"
-        "Komut yazmana gerek yok, sadece ne istediğini söyle!"
+        f"{type_emoji} İşlem kaydedildi!\n\n"
+        f"💼 Hesap: {account_names[account_type]}\n"
+        f"💰 Miktar: {amount:,.0f} TL\n"
+        f"📁 Kategori: {category}\n"
+        f"📝 Açıklama: {description}"
     )
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def handle_financial_report(update: Update, text: str):
+    """Finansal rapor oluştur"""
+    user_id = update.effective_user.id
+    text_lower = text.lower()
     
-    if query.data == "calendar":
-        await query.edit_message_text(
-            f"📅 Takvimini açmak için tıkla:\n"
-            f"https://calendar.google.com/calendar/u/0?cid={GOOGLE_CALENDAR_ID}"
-        )
-    elif query.data == "new_chat":
-        user_id = query.from_user.id
-        if user_id in chat_sessions:
-            del chat_sessions[user_id]
-        await query.edit_message_text("🤖 Sohbet geçmişi temizlendi!")
-    elif query.data == "help":
-        await help_command(update, context)
+    # Period tespiti
+    period = 'month'
+    if 'bugün' in text_lower or 'gün' in text_lower:
+        period = 'day'
+    elif 'hafta' in text_lower:
+        period = 'week'
+    elif 'yıl' in text_lower:
+        period = 'year'
+    
+    # Hesap tipi tespiti
+    account_type = None
+    if 'araba' in text_lower:
+        account_type = 'araba'
+    elif 'emlak' in text_lower:
+        account_type = 'emlak'
+    elif 'kişisel' in text_lower:
+        account_type = 'kisisel'
+    
+    results, totals = get_financial_summary(user_id, period, account_type)
+    
+    if not results:
+        period_names = {'day': 'bugün', 'week': 'bu hafta', 'month': 'bu ay', 'year': 'bu yıl'}
+        await update.message.reply_text(f"📊 {period_names[period].title()} hiç işlem yok.")
+        return
+    
+    # Rapor hazırla
+    period_names = {'day': 'Bugün', 'week': 'Bu Hafta', 'month': 'Bu Ay', 'year': 'Bu Yıl'}
+    account_names = {'araba': 'Araba İşi', 'emlak': 'Emlak İşi', 'kisisel': 'Kişisel'}
+    
+    report = f"📊 {period_names[period]} Mali Durum"
+    if account_type:
+        report += f" - {account_names[account_type]}"
+    report += "\n\n"
+    
+    total_income = 0
+    total_expense = 0
+    
+    for transaction_type, total in totals:
+        if transaction_type == 'gelir':
+            total_income = total
+        else:
+            total_expense = total
+    
+    report += f"📈 Toplam Gelir: {total_income:,.0f} TL\n"
+    report += f"📉 Toplam Gider: {total_expense:,.0f} TL\n"
+    report += f"💰 Net Kar: {(total_income - total_expense):,.0f} TL\n\n"
+    
+    # Kategori detayları
+    income_categories = []
+    expense_categories = []
+    
+    for transaction_type, amount, category in results:
+        if transaction_type == 'gelir':
+            income_categories.append(f"  • {category}: {amount:,.0f} TL")
+        else:
+            expense_categories.append(f"  • {category}: {amount:,.0f} TL")
+    
+    if income_categories:
+        report += "📈 Gelir Detayları:\n" + "\n".join(income_categories) + "\n\n"
+    
+    if expense_categories:
+        report += "📉 Gider Detayları:\n" + "\n".join(expense_categories)
+    
+    keyboard = [
+        [InlineKeyboardButton("📊 Haftalık", callback_data="report_week")],
+        [InlineKeyboardButton("📊 Aylık", callback_data="report_month")],
+        [InlineKeyboardButton("🚗 Araba İşi", callback_data="report_araba")],
+        [InlineKeyboardButton("🏠 Emlak İşi", callback_data="report_emlak")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(report, reply_markup=reply_markup)
 
 async def handle_natural_reminder(update: Update, text: str):
     """Doğal dilden hatırlatıcı oluşturur"""
@@ -184,15 +430,14 @@ async def handle_natural_reminder(update: Update, text: str):
     
     if not parsed_time:
         await update.message.reply_text(
-            "⏰ Hangi zaman için hatırlatıcı ayarlayacağım?\n\n"
-            "Örnek: \"Yarın saat 14:30'da\" veya \"2 saat sonra\""
+            "⏰ Hangi zaman için hatırlatıcı ayarlayacağım?\n"
+            "Örnek: \"Yarın 14:30'da\" veya \"2 saat sonra\""
         )
         return
 
     if not message or len(message.strip()) < 3:
         await update.message.reply_text(
             f"📝 Neyi hatırlatacağımı söylemedin.\n"
-            f"Zaman: {found_time_expr}\n"
             f"Örnek: \"Yarın 14:30'da doktor randevusu\""
         )
         return
@@ -216,7 +461,6 @@ async def handle_natural_reminder(update: Update, text: str):
 
     try:
         result = calendar_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
-        
         formatted_time = parsed_time.strftime('%d %B %Y, %A, Saat %H:%M')
         
         # Türkçe çeviri
@@ -238,26 +482,69 @@ async def handle_natural_reminder(update: Update, text: str):
         for eng, tr in days.items():
             formatted_time = formatted_time.replace(eng, tr)
         
-        keyboard = [[InlineKeyboardButton("📅 Takvimi Aç", callback_data="calendar")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
         await update.message.reply_text(
             f"✅ Hatırlatıcın ayarlandı!\n\n"
             f"📝 {message}\n"
-            f"📅 {formatted_time}",
-            reply_markup=reply_markup
+            f"📅 {formatted_time}"
         )
         
     except Exception as e:
-        logger.error(f"Google Calendar hatası: {e}")
-        await update.message.reply_text("❌ Takvime eklerken sorun oluştu, lütfen tekrar dene.")
+        await update.message.reply_text("❌ Takvime eklerken sorun oluştu.")
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "financial_summary":
+        user_id = query.from_user.id
+        results, totals = get_financial_summary(user_id, 'month')
+        
+        if not totals:
+            await query.edit_message_text("📊 Bu ay hiç işlem yok.")
+            return
+            
+        total_income = sum(total for transaction_type, total in totals if transaction_type == 'gelir')
+        total_expense = sum(total for transaction_type, total in totals if transaction_type == 'gider')
+        
+        report = f"📊 Bu Ay Mali Durum\n\n"
+        report += f"📈 Gelir: {total_income:,.0f} TL\n"
+        report += f"📉 Gider: {total_expense:,.0f} TL\n"
+        report += f"💰 Net: {(total_income - total_expense):,.0f} TL"
+        
+        await query.edit_message_text(report)
+        
+    elif query.data.startswith("report_"):
+        period_or_account = query.data.replace("report_", "")
+        if period_or_account in ['week', 'month']:
+            await handle_financial_report(query, f"bu {period_or_account}")
+        else:
+            await handle_financial_report(query, f"bu ay {period_or_account}")
+            
+    elif query.data == "calendar":
+        await query.edit_message_text(
+            f"📅 Takvimini açmak için tıkla:\n"
+            f"https://calendar.google.com/calendar/u/0?cid={GOOGLE_CALENDAR_ID}"
+        )
+    elif query.data == "new_chat":
+        user_id = query.from_user.id
+        if user_id in chat_sessions:
+            del chat_sessions[user_id]
+        await query.edit_message_text("🤖 Sohbet geçmişi temizlendi!")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ana mesaj işleyici - doğal dil anlama"""
+    """Ana mesaj işleyici"""
     user_text = update.message.text
     intent, text = detect_intent(user_text)
     
-    if intent == 'reminder':
+    if intent == 'financial':
+        await handle_financial_transaction(update, text)
+        return
+        
+    elif intent == 'financial_report':
+        await handle_financial_report(update, text)
+        return
+        
+    elif intent == 'reminder':
         await handle_natural_reminder(update, text)
         return
         
@@ -274,10 +561,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del chat_sessions[user_id]
         await update.message.reply_text("🤖 Sohbet geçmişi temizlendi!")
         return
-        
-    elif intent == 'help':
-        await help_command(update, context)
-        return
     
     # Normal sohbet
     user_id = update.effective_user.id
@@ -292,17 +575,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response.text)
     except Exception as e:
         logger.error(f"Gemini sohbet hatası: {e}")
-        await update.message.reply_text("🤖 Üzgünüm, şu anda sorun yaşıyorum. Tekrar dener misin?")
+        await update.message.reply_text("🤖 Şu anda sorun yaşıyorum. Tekrar dener misin?")
 
 def main() -> None:
     application = Application.builder().token(TOKEN).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("yardim", help_command))
+    application.add_handler(CommandHandler("hesap", account_summary_command))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Kullanıcı dostu bot başlatıldı!")
+    logger.info("Finansal takip sistemli bot başlatıldı!")
     application.run_polling()
 
 if __name__ == "__main__":
