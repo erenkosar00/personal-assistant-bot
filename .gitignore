@@ -1,0 +1,15 @@
+# Virtual Environment
+venv/
+
+# Python Caching
+__pycache__/
+*.pyc
+
+# macOS Files
+.DS_Store
+
+# Environment Variables
+.env
+
+# Exclude backup files
+telegram_bot_backup.py
