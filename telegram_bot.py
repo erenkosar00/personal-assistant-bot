@@ -1,18 +1,19 @@
 """
-Kişisel Telegram Asistan Botu v2.1 - Kararlı Sürüm
-- İnteraktif Butonlar & Komut Menüsü
-- Kapsamlı Kullanım Rehberi (/nasil)
-- Gemini AI Sohbet & Kalıcı Hafıza
+Kişisel Telegram Asistan Botu v3.0 - "Sıfır Komut" Deneyimi
+- Doğal Dil Anlama (AI Tool Use)
+- Gelişmiş Hatırlatıcı ve Planlama
+- Sohbet ve Bilgi Hafızası
 """
 import os
 import logging
 import sqlite3
 import pytz
 import google.generativeai as genai
+import dateparser
 from datetime import datetime
 from pathlib import Path
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, constants
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram import Update, constants
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # Logging ayarları
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -24,230 +25,301 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if not TOKEN: raise ValueError("TELEGRAM_TOKEN ortam değişkeni ayarlanmadı!")
 if not GEMINI_API_KEY: raise ValueError("GEMINI_API_KEY ortam değişkeni ayarlanmadı!")
 
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
-
-chat_sessions = {}
 DB_PATH = Path("assistant.db")
 TIMEZONE = pytz.timezone("Europe/Istanbul")
 
+# --- VERİTABANI İŞLEMLERİ ---
 def setup_database():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT NOT NULL, completed BOOLEAN DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)')
-    cursor.execute('CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT NOT NULL, content TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)')
-    cursor.execute('CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY, user_id INTEGER, chat_id INTEGER, message TEXT NOT NULL, time TEXT NOT NULL, last_sent DATE, active BOOLEAN DEFAULT 1)')
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    cursor.execute('CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT NOT NULL, completed BOOLEAN DEFAULT 0)')
+    cursor.execute('CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT, content TEXT)')
+    # Hatırlatıcı tablosunu tam tarih/saat saklayacak şekilde güncelliyoruz
+    cursor.execute('CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY, user_id INTEGER, chat_id INTEGER, message TEXT NOT NULL, reminder_time TIMESTAMP, status TEXT DEFAULT "active")')
     cursor.execute('CREATE TABLE IF NOT EXISTS memories (user_id INTEGER, key TEXT, value TEXT, PRIMARY KEY (user_id, key))')
-    conn.commit()
-    conn.close()
-
-async def post_init(application: Application):
-    await application.bot.set_my_commands([
-        BotCommand("start", "Asistanı başlatır"),
-        BotCommand("help", "Hızlı yardım menüsünü gösterir"),
-        BotCommand("nasil", "Detaylı kullanım kılavuzunu gösterir"), # <-- DÜZELTME
-        BotCommand("yeni_sohbet", "Yapay zeka sohbet geçmişini sıfırlar"),
-        BotCommand("gorev_ekle", "Yeni bir görev ekler"),
-        BotCommand("gorevler", "Aktif görevleri butonlarla listeler"),
-        BotCommand("not_ekle", "Yeni bir not ekler"),
-        BotCommand("notlar", "Tüm notları butonlarla listeler"),
-        BotCommand("hatirlatici_ekle", "Yeni bir hatırlatıcı kurar"),
-        BotCommand("hatirlaticilar", "Tüm hatırlatıcıları butonlarla listeler"),
-        BotCommand("unutma", "Bota kalıcı bir bilgi öğretir"),
-        BotCommand("hatirla", "Bota öğrettiğiniz bir bilgiyi sorar"),
-    ])
-
-# --- ANA KOMUTLAR ---
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Merhaba! Ben sizin kişisel asistanınızım.\nSohbet çubuğundaki / menüsünden komutları görebilirsiniz veya /nasil yazarak detaylı rehberi okuyabilirsiniz.")
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = ("🆘 HIZLI YARDIM\n\n"
-                 "▫️ /gorevler, /notlar, /hatirlaticilar ile listeleme yap.\n"
-                 "▫️ /gorev_ekle, /not_ekle, /hatirlatici_ekle ile ekleme yap.\n"
-                 "▫️ /unutma [anahtar] [bilgi] ile bana bir şey öğret.\n"
-                 "▫️ /hatirla [anahtar] ile öğrettiğin şeyi sor.\n"
-                 "▫️ /yeni_sohbet ile sohbet hafızamı sıfırla.\n"
-                 "▫️ Detaylı rehber için /nasil yaz.") # <-- DÜZELTME
-    await update.message.reply_text(help_text)
-
-async def nasil_command(update: Update, context: ContextTypes.DEFAULT_TYPE): # <-- DÜZELTME
-    guide_text = """
-🤖 **Asistanını Nasıl Kullanırsın?**
-
-Merhaba! İşte beni nasıl verimli kullanabileceğinle ilgili detaylı rehber:
-
-🧠 **Yapay Zeka ile Sohbet**
-Benimle herhangi bir konuda, komut kullanmadan sohbet edebilirsin. Sohbetlerimizi hatırlarım! Eğer sohbet karışırsa  komutuyla hafızamı sıfırlayabilirsin.
-
-💾 **Kalıcı Hafıza**
-Bana kalıcı bilgiler öğretebilirsin.
-• 
-• 
-Daha sonra sohbet içinde bu bilgileri kullanırım veya  komutuyla öğrettiğin bilgiyi sana söylerim.
-
-📋 **Görev Yönetimi**
-• **Ekle:** 
-• **Listele & Tamamla:**  komutuyla görevlerini listele ve çıkan ✅ butonlarına basarak tamamla.
-
-📝 **Not Alma**
-• **Ekle:** 
-• **Listele & Sil:**  komutuyla notlarını listele ve çıkan 🗑️ butonlarına basarak sil.
-
-🔔 **Hatırlatıcılar**
-• **Kur:**  (HH:MM formatında)
-• **Listele & Sil:**  komutuyla hatırlatıcılarını listele ve 🗑️ butonlarıyla sil.
-    """
-    await update.message.reply_text(guide_text, parse_mode='Markdown')
-
-async def new_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in chat_sessions:
-        del chat_sessions[user_id]
-        await update.message.reply_text("🤖 Sohbet geçmişiniz temizlendi.")
-    else:
-        await update.message.reply_text("🤖 Zaten yeni bir sohbetteyiz.")
-
-async def unutma_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if len(context.args) < 2: await update.message.reply_text("Kullanım: /unutma [anahtar] [kaydedilecek bilgi]"); return
-    key = context.args[0].lower(); value = ' '.join(context.args[1:])
-    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    cursor.execute('INSERT OR REPLACE INTO memories (user_id, key, value) VALUES (?, ?, ?)', (user_id, key, value))
-    conn.commit(); conn.close()
-    await update.message.reply_text(f"🧠 Hafızama kaydettim: {key} = {value}")
-
-async def hatirla_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not context.args: await update.message.reply_text("Kullanım: /hatirla [anahtar]"); return
-    key = context.args[0].lower()
-    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    cursor.execute('SELECT value FROM memories WHERE user_id = ? AND key = ?', (user_id, key))
-    result = cursor.fetchone(); conn.close()
-    if result: await update.message.reply_text(f"🧠 Hatırlıyorum: {key} = {result[0]}")
-    else: await update.message.reply_text(f"🤔 '{key}' hakkında bir şey hatırlamıyorum.")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id; user_text = update.message.text
-    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    cursor.execute('SELECT key, value FROM memories WHERE user_id = ?', (user_id,))
-    memories = cursor.fetchall(); conn.close()
-    long_term_memory_context = "\n".join([f"- {key}: {value}" for key, value in memories])
-    system_prompt = f"Sen, sahibinin kişisel bir asistanısın. Sahibin hakkında bilmen gereken bazı özel bilgiler şunlar:\n{long_term_memory_context}\n\nBu bilgileri kullanarak kısa ve samimi cevaplar ver."
-    if user_id not in chat_sessions:
-        logger.info(f"Kullanıcı {user_id} için yeni sohbet oturumu oluşturuluyor.")
-        chat_sessions[user_id] = gemini_model.start_chat(history=[{'role': 'user', 'parts': [system_prompt]},{'role': 'model', 'parts': ["Anlaşıldı. Sahibim hakkında bu bilgileri hatırlayacağım ve ona göre davranacağım."]}])
-    chat_session = chat_sessions[user_id]
-    try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=constants.ChatAction.TYPING)
-        response = await chat_session.send_message_async(user_text)
-        await update.message.reply_text(response.text)
-    except Exception as e:
-        logger.error(f"Gemini API hatası (kullanıcı: {user_id}): {e}")
-        await update.message.reply_text("🤖 Üzgünüm, yapay zeka modülümde bir sorun oluştu. Lütfen /yeni_sohbet komutuyla hafızamı sıfırlayın.")
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    action, value = query.data.split(':'); item_id = int(value); user_id = query.from_user.id
-    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    if action == "complete_task":
-        cursor.execute('UPDATE tasks SET completed = 1 WHERE id = ? AND user_id = ?', (item_id, user_id))
-        await query.edit_message_text(text=f"🎉 Görev (ID: {item_id}) başarıyla tamamlandı!")
-    elif action == "delete_note":
-        cursor.execute('DELETE FROM notes WHERE id = ? AND user_id = ?', (item_id, user_id))
-        await query.edit_message_text(text=f"🗑️ Not (ID: {item_id}) başarıyla silindi!")
-    elif action == "delete_reminder":
-        cursor.execute('UPDATE reminders SET active = 0 WHERE id = ? AND user_id = ?', (item_id, user_id))
-        await query.edit_message_text(text=f"🗑️ Hatırlatıcı (ID: {item_id}) başarıyla silindi!")
     conn.commit(); conn.close()
 
-async def add_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not context.args: await update.message.reply_text("Kullanım: /gorev_ekle [görev metni]"); return
-    title = ' '.join(context.args); conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+# --- GEMINI'NİN KULLANACAĞI "ALETLER" (PYTHON FONKSİYONLARI) ---
+def add_task(user_id: int, title: str) -> str:
+    """Kullanıcının görev listesine yeni bir görev ekler."""
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
     cursor.execute('INSERT INTO tasks (user_id, title) VALUES (?, ?)', (user_id, title))
-    task_id = cursor.lastrowid; conn.commit(); conn.close()
-    await update.message.reply_text(f"✅ Görev eklendi: '{title}' (ID: {task_id})")
+    conn.commit(); conn.close()
+    logger.info(f"Görev eklendi: {title} (Kullanıcı: {user_id})")
+    return f"'{title}' görevi başarıyla eklendi."
 
-async def list_tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id; conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    cursor.execute('SELECT id, title FROM tasks WHERE user_id = ? AND completed = 0 ORDER BY created_at DESC', (user_id,))
-    items = cursor.fetchall(); conn.close()
-    if not items: await update.message.reply_text("📭 Aktif göreviniz bulunmuyor!"); return
-    keyboard = [[InlineKeyboardButton(f"✅ {title}", callback_data=f"complete_task:{item_id}")] for item_id, title in items]
-    await update.message.reply_text("📋 Aktif Görevleriniz (Tamamlamak için butona basın):", reply_markup=InlineKeyboardMarkup(keyboard))
+def list_tasks(user_id: int) -> str:
+    """Kullanıcının tamamlanmamış tüm görevlerini listeler."""
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    cursor.execute('SELECT title FROM tasks WHERE user_id = ? AND completed = 0', (user_id,))
+    tasks = cursor.fetchall(); conn.close()
+    if not tasks: return "Şu anda aktif bir görevin yok."
+    return "Aktif görevlerin şunlar:\n- " + "\n- ".join([task[0] for task in tasks])
 
-async def add_note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if len(context.args) < 2: await update.message.reply_text("Kullanım: /not_ekle [başlık] [içerik]"); return
-    title = context.args[0]; content = ' '.join(context.args[1:])
+def add_note(user_id: int, title: str, content: str) -> str:
+    """Kullanıcı için yeni bir not kaydeder."""
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
     cursor.execute('INSERT INTO notes (user_id, title, content) VALUES (?, ?, ?)', (user_id, title, content))
-    note_id = cursor.lastrowid; conn.commit(); conn.close()
-    await update.message.reply_text(f"📝 Not kaydedildi: '{title}' (ID: {note_id})")
+    conn.commit(); conn.close()
+    logger.info(f"Not eklendi: {title} (Kullanıcı: {user_id})")
+    return f"'{title}' başlıklı notun başarıyla kaydedildi."
 
-async def list_notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id; conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    cursor.execute('SELECT id, title FROM notes WHERE user_id = ? ORDER BY created_at DESC LIMIT 10', (user_id,))
-    items = cursor.fetchall(); conn.close()
-    if not items: await update.message.reply_text("📭 Henüz notunuz bulunmuyor!"); return
-    keyboard = [[InlineKeyboardButton(f"🗑️ {title}", callback_data=f"delete_note:{item_id}")] for item_id, title in items]
-    await update.message.reply_text("📝 Son Notlarınız (Silmek için butona basın):", reply_markup=InlineKeyboardMarkup(keyboard))
+def set_reminder(user_id: int, chat_id: int, time_string: str, message: str) -> str:
+    """Kullanıcı için belirtilen zamanda bir hatırlatıcı kurar."""
+    parsed_time = dateparser.parse(time_string, settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'Europe/Istanbul'})
+    if not parsed_time:
+        return "Üzgünüm, belirttiğin zamanı anlayamadım. Lütfen 'yarın 15:30' gibi daha net bir ifade kullan."
 
-async def add_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id; chat_id = update.effective_chat.id
-    if len(context.args) < 2: await update.message.reply_text("Kullanım: /hatirlatici_ekle [saat] [mesaj]"); return
-    time_str = context.args[0]; message = ' '.join(context.args[1:])
-    try:
-        hour, minute = map(int, time_str.split(':'))
-        if not (0 <= hour <= 23 and 0 <= minute <= 59): raise ValueError
-    except (ValueError): await update.message.reply_text("❌ Geçersiz saat formatı (HH:MM)!"); return
+    reminder_time_utc = parsed_time.astimezone(pytz.utc)
+
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    cursor.execute('INSERT INTO reminders (user_id, chat_id, message, time) VALUES (?, ?, ?, ?)',(user_id, chat_id, message, time_str))
-    r_id = cursor.lastrowid; conn.commit(); conn.close()
-    await update.message.reply_text(f"🔔 Hatırlatıcı eklendi!\n⏰ {time_str} - {message}\n🆔 ID: {r_id}")
+    cursor.execute('INSERT INTO reminders (user_id, chat_id, message, reminder_time) VALUES (?, ?, ?, ?)', 
+                   (user_id, chat_id, message, reminder_time_utc))
+    conn.commit(); conn.close()
 
-async def list_reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id; conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    cursor.execute('SELECT id, message, time FROM reminders WHERE user_id = ? AND active = 1 ORDER BY time', (user_id,))
-    items = cursor.fetchall(); conn.close()
-    if not items: await update.message.reply_text("📭 Aktif hatırlatıcınız yok!"); return
-    keyboard = [[InlineKeyboardButton(f"🗑️ {time_str} - {msg}", callback_data=f"delete_reminder:{item_id}")] for item_id, msg, time_str in items]
-    await update.message.reply_text("🔔 Aktif Hatırlatıcılarınız (Silmek için butona basın):", reply_markup=InlineKeyboardMarkup(keyboard))
+    formatted_time = parsed_time.strftime('%d %B %Y, Saat %H:%M')
+    logger.info(f"Hatırlatıcı kuruldu: {message} -> {formatted_time} (Kullanıcı: {user_id})")
+    return f"Tamamdır, '{formatted_time}' için '{message}' hatırlatıcısını kurdum."
+
+# Gemini'yi ve aletlerini yapılandır
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_tools = [add_task, list_tasks, add_note, set_reminder]
+gemini_model = genai.GenerativeModel(model_name='gemini-1.5-flash-latest', tools=gemini_tools)
+chat_sessions = {}
+
+# --- ANA KONTROL FONKSİYONLARI ---
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 Merhaba! Ben senin kişisel asistanınım. Artık komutlara ihtiyacın yok, sadece ne istediğini söyle.")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id; chat_id = update.effective_chat.id; user_text = update.message.text
+
+    if user_id not in chat_sessions:
+        chat_sessions[user_id] = gemini_model.start_chat()
+    chat = chat_sessions[user_id]
+
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+        response = await chat.send_message_async(user_text)
+
+        # Gemini bir alet kullanmak isterse...
+        if response.candidates[0].content.parts[0].function_call:
+            fc = response.candidates[0].content.parts[0].function_call
+            tool_name = fc.name
+            tool_args = {key: value for key, value in fc.args.items()}
+
+            # Doğru aleti bul ve çalıştır
+            tool_to_call = next((t for t in gemini_tools if t.__name__ == tool_name), None)
+            if tool_to_call:
+                # Gerekli ID'leri argümanlara ekle
+                if 'user_id' in tool_to_call.__annotations__: tool_args['user_id'] = user_id
+                if 'chat_id' in tool_to_call.__annotations__: tool_args['chat_id'] = chat_id
+
+                tool_response = tool_to_call(**tool_args)
+
+                # Aletin sonucunu Gemini'ye geri göndererek son kullanıcı cevabını oluşturmasını sağla
+                response = await chat.send_message_async(
+                    genai.Part.from_function_response(name=tool_name, response={'result': tool_response})
+                )
+
+        await update.message.reply_text(response.text)
+
+    except Exception as e:
+        logger.error(f"İşlem hatası (kullanıcı: {user_id}): {e}")
+        await update.message.reply_text("🤖 Üzgünüm, bir sorunla karşılaştım. Lütfen tekrar dener misin?")
 
 async def check_reminders_job(context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.now(TIMEZONE); current_time = now.strftime("%H:%M"); current_date = now.strftime("%Y-%m-%d")
+    """Her dakika çalışıp zamanı gelmiş hatırlatıcıları gönderir."""
+    now_utc = datetime.now(pytz.utc)
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    cursor.execute('SELECT id, chat_id, message FROM reminders WHERE active = 1 AND time = ? AND (last_sent != ? OR last_sent IS NULL)', (current_time, current_date))
+    cursor.execute("SELECT id, chat_id, message FROM reminders WHERE status = 'active' AND reminder_time <= ?", (now_utc,))
     reminders = cursor.fetchall()
+
     for r_id, chat_id, message in reminders:
         try:
             await context.bot.send_message(chat_id=chat_id, text=f"🔔 HATIRLATICI\n\n{message}")
-            cursor.execute('UPDATE reminders SET last_sent = ? WHERE id = ?', (current_date, r_id)); conn.commit()
+            cursor.execute("UPDATE reminders SET status = 'sent' WHERE id = ?", (r_id,))
+            conn.commit()
             logger.info(f"Hatırlatıcı gönderildi: ID {r_id}")
-        except Exception as e: logger.error(f"Hatırlatıcı ID {r_id} gönderilemedi: {e}")
+        except Exception as e:
+            logger.error(f"Hatırlatıcı ID {r_id} gönderilemedi: {e}")
     conn.close()
 
 def main() -> None:
-    """Botu başlatır ve çalışır halde tutar."""
     setup_database()
-    application = Application.builder().token(TOKEN).post_init(post_init).build()
+    application = Application.builder().token(TOKEN).build()
 
-    application.add_handlers([
-        CommandHandler("start", start_command), CommandHandler("help", help_command),
-        CommandHandler("nasil", nasil_command), CommandHandler("yeni_sohbet", new_chat_command), # <-- DÜZELTME
-        CommandHandler("unutma", unutma_command), CommandHandler("hatirla", hatirla_command),
-        CommandHandler("gorev_ekle", add_task_command), CommandHandler("gorevler", list_tasks_command),
-        CommandHandler("not_ekle", add_note_command), CommandHandler("notlar", list_notes_command),
-        CommandHandler("hatirlatici_ekle", add_reminder_command), CommandHandler("hatirlaticilar", list_reminders_command),
-        CallbackQueryHandler(button_handler),
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-    ])
+    # Sadece temel komutları ve ana sohbet yöneticisini ekliyoruz
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # Hatırlatıcıları kontrol eden periyodik görevi başlat
     job_queue = application.job_queue
     job_queue.run_repeating(check_reminders_job, interval=60, first=10)
 
-    logger.info("Botun son versiyonu başlatıldı, tüm geliştirmeler aktif!")
+    logger.info("Botun 'Sıfır Komut' versiyonu başlatıldı!")
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
+"""
+Kişisel Telegram Asistan Botu v3.0 - "Sıfır Komut" Deneyimi
+- Doğal Dil Anlama (AI Tool Use)
+- Gelişmiş Hatırlatıcı ve Planlama
+- Sohbet ve Bilgi Hafızası
+"""
+import os
+import logging
+import sqlite3
+import pytz
+import google.generativeai as genai
+import dateparser
+from datetime import datetime
+from pathlib import Path
+from telegram import Update, constants
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+# Logging ayarları
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- API ANAHTARLARI VE AYARLAR ---
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if not TOKEN: raise ValueError("TELEGRAM_TOKEN ortam değişkeni ayarlanmadı!")
+if not GEMINI_API_KEY: raise ValueError("GEMINI_API_KEY ortam değişkeni ayarlanmadı!")
+
+DB_PATH = Path("assistant.db")
+TIMEZONE = pytz.timezone("Europe/Istanbul")
+
+# --- VERİTABANI İŞLEMLERİ ---
+def setup_database():
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    cursor.execute('CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT NOT NULL, completed BOOLEAN DEFAULT 0)')
+    cursor.execute('CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT, content TEXT)')
+    # Hatırlatıcı tablosunu tam tarih/saat saklayacak şekilde güncelliyoruz
+    cursor.execute('CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY, user_id INTEGER, chat_id INTEGER, message TEXT NOT NULL, reminder_time TIMESTAMP, status TEXT DEFAULT "active")')
+    cursor.execute('CREATE TABLE IF NOT EXISTS memories (user_id INTEGER, key TEXT, value TEXT, PRIMARY KEY (user_id, key))')
+    conn.commit(); conn.close()
+
+# --- GEMINI'NİN KULLANACAĞI "ALETLER" (PYTHON FONKSİYONLARI) ---
+def add_task(user_id: int, title: str) -> str:
+    """Kullanıcının görev listesine yeni bir görev ekler."""
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    cursor.execute('INSERT INTO tasks (user_id, title) VALUES (?, ?)', (user_id, title))
+    conn.commit(); conn.close()
+    logger.info(f"Görev eklendi: {title} (Kullanıcı: {user_id})")
+    return f"'{title}' görevi başarıyla eklendi."
+
+def list_tasks(user_id: int) -> str:
+    """Kullanıcının tamamlanmamış tüm görevlerini listeler."""
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    cursor.execute('SELECT title FROM tasks WHERE user_id = ? AND completed = 0', (user_id,))
+    tasks = cursor.fetchall(); conn.close()
+    if not tasks: return "Şu anda aktif bir görevin yok."
+    return "Aktif görevlerin şunlar:\n- " + "\n- ".join([task[0] for task in tasks])
+
+def add_note(user_id: int, title: str, content: str) -> str:
+    """Kullanıcı için yeni bir not kaydeder."""
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    cursor.execute('INSERT INTO notes (user_id, title, content) VALUES (?, ?, ?)', (user_id, title, content))
+    conn.commit(); conn.close()
+    logger.info(f"Not eklendi: {title} (Kullanıcı: {user_id})")
+    return f"'{title}' başlıklı notun başarıyla kaydedildi."
+
+def set_reminder(user_id: int, chat_id: int, time_string: str, message: str) -> str:
+    """Kullanıcı için belirtilen zamanda bir hatırlatıcı kurar."""
+    parsed_time = dateparser.parse(time_string, settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'Europe/Istanbul'})
+    if not parsed_time:
+        return "Üzgünüm, belirttiğin zamanı anlayamadım. Lütfen 'yarın 15:30' gibi daha net bir ifade kullan."
+
+    reminder_time_utc = parsed_time.astimezone(pytz.utc)
+
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    cursor.execute('INSERT INTO reminders (user_id, chat_id, message, reminder_time) VALUES (?, ?, ?, ?)', 
+                   (user_id, chat_id, message, reminder_time_utc))
+    conn.commit(); conn.close()
+
+    formatted_time = parsed_time.strftime('%d %B %Y, Saat %H:%M')
+    logger.info(f"Hatırlatıcı kuruldu: {message} -> {formatted_time} (Kullanıcı: {user_id})")
+    return f"Tamamdır, '{formatted_time}' için '{message}' hatırlatıcısını kurdum."
+
+# Gemini'yi ve aletlerini yapılandır
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_tools = [add_task, list_tasks, add_note, set_reminder]
+gemini_model = genai.GenerativeModel(model_name='gemini-1.5-flash-latest', tools=gemini_tools)
+chat_sessions = {}
+
+# --- ANA KONTROL FONKSİYONLARI ---
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 Merhaba! Ben senin kişisel asistanınım. Artık komutlara ihtiyacın yok, sadece ne istediğini söyle.")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id; chat_id = update.effective_chat.id; user_text = update.message.text
+
+    if user_id not in chat_sessions:
+        chat_sessions[user_id] = gemini_model.start_chat()
+    chat = chat_sessions[user_id]
+
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+        response = await chat.send_message_async(user_text)
+
+        # Gemini bir alet kullanmak isterse...
+        if response.candidates[0].content.parts[0].function_call:
+            fc = response.candidates[0].content.parts[0].function_call
+            tool_name = fc.name
+            tool_args = {key: value for key, value in fc.args.items()}
+
+            # Doğru aleti bul ve çalıştır
+            tool_to_call = next((t for t in gemini_tools if t.__name__ == tool_name), None)
+            if tool_to_call:
+                # Gerekli ID'leri argümanlara ekle
+                if 'user_id' in tool_to_call.__annotations__: tool_args['user_id'] = user_id
+                if 'chat_id' in tool_to_call.__annotations__: tool_args['chat_id'] = chat_id
+
+                tool_response = tool_to_call(**tool_args)
+
+                # Aletin sonucunu Gemini'ye geri göndererek son kullanıcı cevabını oluşturmasını sağla
+                response = await chat.send_message_async(
+                    genai.Part.from_function_response(name=tool_name, response={'result': tool_response})
+                )
+
+        await update.message.reply_text(response.text)
+
+    except Exception as e:
+        logger.error(f"İşlem hatası (kullanıcı: {user_id}): {e}")
+        await update.message.reply_text("🤖 Üzgünüm, bir sorunla karşılaştım. Lütfen tekrar dener misin?")
+
+async def check_reminders_job(context: ContextTypes.DEFAULT_TYPE):
+    """Her dakika çalışıp zamanı gelmiş hatırlatıcıları gönderir."""
+    now_utc = datetime.now(pytz.utc)
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    cursor.execute("SELECT id, chat_id, message FROM reminders WHERE status = 'active' AND reminder_time <= ?", (now_utc,))
+    reminders = cursor.fetchall()
+
+    for r_id, chat_id, message in reminders:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=f"🔔 HATIRLATICI\n\n{message}")
+            cursor.execute("UPDATE reminders SET status = 'sent' WHERE id = ?", (r_id,))
+            conn.commit()
+            logger.info(f"Hatırlatıcı gönderildi: ID {r_id}")
+        except Exception as e:
+            logger.error(f"Hatırlatıcı ID {r_id} gönderilemedi: {e}")
+    conn.close()
+
+def main() -> None:
+    setup_database()
+    application = Application.builder().token(TOKEN).build()
+
+    # Sadece temel komutları ve ana sohbet yöneticisini ekliyoruz
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Hatırlatıcıları kontrol eden periyodik görevi başlat
+    job_queue = application.job_queue
+    job_queue.run_repeating(check_reminders_job, interval=60, first=10)
+
+    logger.info("Botun 'Sıfır Komut' versiyonu başlatıldı!")
     application.run_polling()
 
 if __name__ == "__main__":
