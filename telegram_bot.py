@@ -28,7 +28,7 @@ TIMEZONE = pytz.timezone("Europe/Istanbul")
 # --- VERİTABANI ---
 def setup_database():
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    cursor.execute('CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY, user_id INTEGER, chat_id INTEGER, message TEXT NOT NULL, reminder_time TIMESTAMP, status TEXT DEFAULT "active")')
+    cursor.execute('CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY, user_id INTEGER, chat_id INTEGER, message TEXT NOT NULL, reminder_time TEXT, status TEXT DEFAULT "active")')
     conn.commit(); conn.close()
 
 # --- GEMINI'NİN KULLANACAĞI "ALETLER" ---
@@ -39,9 +39,12 @@ def set_reminder(user_id: int, chat_id: int, time_string: str, message: str) -> 
         return "Üzgünüm, belirttiğin zamanı anlayamadım. Lütfen 'yarın 15:30' gibi daha net bir ifade kullan."
 
     reminder_time_utc = parsed_time.astimezone(pytz.utc)
+    # --- DÜZELTME: Zamanı veritabanına her zaman aynı formatta kaydet ---
+    reminder_time_str = reminder_time_utc.strftime('%Y-%m-%d %H:%M:%S')
 
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    cursor.execute('INSERT INTO reminders (user_id, chat_id, message, reminder_time) VALUES (?, ?, ?, ?)', (user_id, chat_id, message, reminder_time_utc))
+    cursor.execute('INSERT INTO reminders (user_id, chat_id, message, reminder_time) VALUES (?, ?, ?, ?)', 
+                   (user_id, chat_id, message, reminder_time_str))
     conn.commit(); conn.close()
 
     formatted_time = parsed_time.strftime('%d %B %Y, Saat %H:%M')
@@ -67,8 +70,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
         response = await chat.send_message_async(user_text)
 
-        # Gemini bir alet kullanmak isterse...
-        if response.candidates[0].content.parts[0].function_call:
+        if response.candidates and response.candidates[0].content.parts and response.candidates[0].content.parts[0].function_call:
             fc = response.candidates[0].content.parts[0].function_call
             if fc.name == "set_reminder":
                 tool_args = {key: value for key, value in fc.args.items()}
@@ -76,14 +78,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tool_args['chat_id'] = chat_id
                 tool_response_content = set_reminder(**tool_args)
 
-                # DÜZELTME: Aletin sonucunu Gemini'ye doğru formatla geri gönderiyoruz.
                 response = await chat.send_message_async(
-                    genai.protos.Part(
-                        function_response=genai.protos.FunctionResponse(
-                            name=fc.name,
-                            response={'result': tool_response_content}
-                        )
-                    )
+                    genai.protos.Part(function_response=genai.protos.FunctionResponse(name=fc.name, response={'result': tool_response_content}))
                 )
 
         await update.message.reply_text(response.text)
@@ -94,8 +90,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def check_reminders_job(context: ContextTypes.DEFAULT_TYPE):
     """Her dakika çalışıp zamanı gelmiş hatırlatıcıları gönderir."""
     now_utc = datetime.now(pytz.utc)
+    # --- DÜZELTME: Zamanı veritabanından okurken de aynı formatı kullan ---
+    now_utc_str = now_utc.strftime('%Y-%m-%d %H:%M:%S')
+
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    cursor.execute("SELECT id, chat_id, message FROM reminders WHERE status = 'active' AND reminder_time <= ?", (now_utc.strftime('%Y-%m-%d %H:%M:%S'),))
+    cursor.execute("SELECT id, chat_id, message FROM reminders WHERE status = 'active' AND reminder_time <= ?", (now_utc_str,))
     reminders = cursor.fetchall()
 
     for r_id, chat_id, message in reminders:
