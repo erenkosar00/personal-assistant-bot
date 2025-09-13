@@ -1,21 +1,19 @@
 """
-Kişisel Telegram Asistan Botu v4.1 - Kararlı, Akıllı Komutlar
-Google Calendar Entegrasyonlu
+Kişisel Telegram Asistan Botu v5.0 - Kararlı ve Akıllı Sürüm
 """
 import os
 import logging
-import sqlite3
-import pytz
-import google.generativeai as genai
-import dateparser
 import base64
 import json
+import pytz
+import dateparser
 from datetime import datetime, timedelta
 from pathlib import Path
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+import google.generativeai as genai
 
 # Logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -60,27 +58,33 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Lütfen hatırlatıcı için bir zaman ve mesaj belirtin.\nÖrnek: ")
+        await update.message.reply_text("Lütfen hatırlatıcı için bir zaman ve mesaj belirt.\nÖrnek: ")
         return
 
     full_text = " ".join(context.args)
-    # Türkçe'yi daha iyi anlaması için dil listesi ekliyoruz.
-    parsed_time = dateparser.parse(full_text, languages=['tr'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'Europe/Istanbul'})
 
-    if not parsed_time:
-        await update.message.reply_text("Üzgünüm, belirttiğin zamanı anlayamadım. Lütfen 'yarın 15:30' veya '2 saat sonra' gibi bir ifade kullan.")
+    # Zamanı ve mesajı ayıran yeni, akıllı mantık
+    parsed_time = None
+    message = ""
+    for i in range(1, len(context.args) + 1):
+        time_candidate_str = " ".join(context.args[:i])
+        # Türkçe'yi ve 'de, 'da eklerini daha iyi anlaması için ayar
+        time_candidate = dateparser.parse(time_candidate_str, languages=['tr'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'Europe/Istanbul'})
+        if time_candidate:
+            parsed_time = time_candidate
+            message = " ".join(context.args[i:])
+
+    if not parsed_time or not message:
+        await update.message.reply_text("Üzgünüm, zamanı veya mesajı ayırt edemedim. Lütfen 'yarın 15:30' veya '2 saat sonra' gibi bir ifadeyle başlayın.")
         return
 
-    # Basit bir mantıkla mesajı ayrıştıralım
-    message = full_text
-
-    # Google Takvim için etkinliği oluştur
     event = {
         'summary': message,
         'start': {'dateTime': parsed_time.isoformat(), 'timeZone': 'Europe/Istanbul'},
         'end': {'dateTime': (parsed_time + timedelta(minutes=30)).isoformat(), 'timeZone': 'Europe/Istanbul'},
         'reminders': {'useDefault': False, 'overrides': [{'method': 'popup', 'minutes': 10}]},
     }
+
     try:
         calendar_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
         formatted_time = parsed_time.strftime('%d %B %Y, Saat %H:%M')
@@ -90,7 +94,7 @@ async def set_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Takvimine etkinlik eklerken bir sorun oluştu. Google Cloud ayarlarını kontrol et.")
 
 async def calendar_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Google Takvimini açmak için buraya tıkla:\nhttps://calendar.google.com/")
+    await update.message.reply_text(f"Asistan Takvimini açmak için tıkla:\nhttps://calendar.google.com/calendar/u/0?cid={GOOGLE_CALENDAR_ID}")
 
 async def new_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -117,7 +121,7 @@ def main() -> None:
     application.add_handler(CommandHandler("yeni_sohbet", new_chat_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Botun kararlı ve akıllı komut versiyonu başlatıldı!")
+    logger.info("Botun son kararlı versiyonu başlatıldı!")
     application.run_polling()
 
 if __name__ == "__main__":
