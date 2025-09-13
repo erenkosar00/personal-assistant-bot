@@ -7,7 +7,8 @@ import base64
 import json
 import pytz
 import dateparser
-from dateparser.search import search_dates # <-- YENİ İMPORT
+from dateparser.search import search_dates
+import re # Temizleme işlemi için re kütüphanesini ekliyoruz
 from datetime import datetime, timedelta
 from pathlib import Path
 from telegram import Update, BotCommand
@@ -64,15 +65,22 @@ async def set_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     full_text = " ".join(context.args)
 
-    # --- DÜZELTME: search_dates fonksiyonunu doğru şekilde çağırıyoruz ---
-    results = search_dates(full_text, languages=['tr'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'Europe/Istanbul'})
+    # --- DÜZELTME: Zaman ifadesini temizleyerek parser'a yardımcı oluyoruz ---
+    # "11'de" gibi ifadeleri "11" yapar
+    cleaned_text = re.sub(r"(\d{1,2}:\d{2})'([a-z]+)", r"\1", full_text)
+    cleaned_text = re.sub(r"(\d{1,2})'([a-z]+)", r"\1", cleaned_text)
+
+    results = search_dates(cleaned_text, languages=['tr'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'Europe/Istanbul'})
 
     if not results:
         await update.message.reply_text("Üzgünüm, cümlenin içinde bir zaman ifadesi bulamadım. Lütfen 'yarın 15:30' veya '2 saat sonra' gibi bir ifade kullan.")
         return
 
     found_date_string, parsed_time = results[0]
-    message = full_text.replace(found_date_string, "").strip()
+
+    # Orijinal metinden, bulunan ifadenin "temizlenmiş" halini çıkararak mesajı bul
+    original_found_string = dateparser.search.search_dates(full_text, languages=['tr'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'Europe/Istanbul'})[0][0]
+    message = full_text.replace(original_found_string, "").strip()
 
     if not message:
         await update.message.reply_text("Hatırlatıcı için bir mesaj bulamadım. Lütfen zaman ifadesinden sonra neyi hatırlatacağımı da yaz.")
@@ -91,7 +99,7 @@ async def set_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"✅ Google Takvimine eklendi!\n\n🗓️ Etkinlik: {message}\n⏰ Zaman: {formatted_time}")
     except Exception as e:
         logger.error(f"Google Calendar API hatası: {e}")
-        await update.message.reply_text("Takvimine etkinlik eklerken bir sorun oluştu. Google Cloud ayarlarını kontrol et.")
+        await update.message.reply_text("Takvimine etkinlik eklerken bir sorun oluştu.")
 
 async def calendar_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Asistan Takvimini açmak için tıkla:\nhttps://calendar.google.com/calendar/u/0?cid={GOOGLE_CALENDAR_ID}")
