@@ -658,4 +658,4 @@ class CarDealerBot:
                 {
                     "title": "🎉 Tebrikler! Hazırsınız!",
                     "text": (
-                        "Artık tüm özellikleri kullanabilir
+                        "Artık tüm özellikleri kullanabilirsiniz:\n\n"
