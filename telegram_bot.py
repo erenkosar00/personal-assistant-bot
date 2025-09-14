@@ -1,20 +1,26 @@
 """
-Araba Satış Asistanı v3.0 - Final Perfect Version
-Finansal takip + Google Calendar + AI Uzman + Onboarding
+Araba Satış Asistanı v3.1 - Production Ready
+Tüm deployment sorunları çözülmüş versiyon
 """
 import os
 import logging
 import base64
 import json
-import pytz
 import re
 import sqlite3
+import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 from telegram import Update, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 
-# Optional imports
+# Optional imports with graceful fallback
+try:
+    import pytz
+    TIMEZONE_AVAILABLE = True
+except ImportError:
+    TIMEZONE_AVAILABLE = False
+
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
@@ -34,66 +40,96 @@ logger = logging.getLogger(__name__)
 
 class CarDealerBot:
     def __init__(self):
-        # Telegram Token
+        # Telegram Token - Required
         self.token = os.environ.get("TELEGRAM_TOKEN")
         if not self.token:
             raise ValueError("TELEGRAM_TOKEN environment variable required!")
         
-        # Database
-        self.db_path = Path.home() / ".telegram_assistant" / "car_dealer.db"
+        # Database - Use /tmp for Railway compatibility
+        self.db_path = Path("/tmp") / "car_dealer.db"
         self.setup_database()
         
-        # Google Calendar
+        # Google Calendar - Optional
         self.calendar_service = None
         self.calendar_id = os.environ.get("GOOGLE_CALENDAR_ID")
         self.setup_google_calendar()
         
-        # Gemini AI
+        # Gemini AI - Optional
         self.gemini_model = None
         self.chat_sessions = {}
+        self.max_sessions = 100  # Prevent memory leak
         self.setup_gemini_ai()
         
+        # Timezone handling
+        self.timezone = self.get_timezone()
+        
+    def get_timezone(self):
+        """Get timezone with fallback"""
+        if TIMEZONE_AVAILABLE:
+            return pytz.timezone('Europe/Istanbul')
+        else:
+            # Fallback - assume UTC+3 for Turkey
+            return None
+            
+    def get_current_time(self):
+        """Get current time with timezone handling"""
+        if self.timezone:
+            return datetime.now(self.timezone)
+        else:
+            # Fallback to UTC+3
+            return datetime.utcnow() + timedelta(hours=3)
+        
     def setup_database(self):
-        """Database kurulumu"""
-        os.makedirs(self.db_path.parent, exist_ok=True)
-        
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Transactions table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY,
-                user_id INTEGER,
-                account_type TEXT,
-                transaction_type TEXT,
-                amount REAL,
-                category TEXT,
-                description TEXT,
-                date TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Users table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                onboarded BOOLEAN DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-        logger.info("Database ready")
+        """Database setup with error handling"""
+        try:
+            # Ensure directory exists
+            os.makedirs(self.db_path.parent, exist_ok=True)
+            
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Transactions table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    account_type TEXT NOT NULL,
+                    transaction_type TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    category TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Users table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    onboarded BOOLEAN DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Create indexes for performance
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date)')
+            
+            conn.commit()
+            conn.close()
+            logger.info("Database initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Database setup failed: {e}")
+            raise
         
     def setup_google_calendar(self):
-        """Google Calendar kurulumu"""
+        """Google Calendar setup with error handling"""
         if not GOOGLE_AVAILABLE:
-            logger.warning("Google libraries not available")
+            logger.warning("Google Calendar libraries not available")
             return
             
         try:
@@ -108,16 +144,17 @@ class CarDealerBot:
                 )
                 
                 self.calendar_service = build('calendar', 'v3', credentials=credentials)
-                logger.info("Google Calendar initialized")
+                logger.info("Google Calendar initialized successfully")
             else:
-                logger.warning("Google Calendar credentials not found")
+                logger.info("Google Calendar credentials not provided - feature disabled")
         except Exception as e:
             logger.error(f"Google Calendar setup failed: {e}")
+            self.calendar_service = None
             
     def setup_gemini_ai(self):
-        """Gemini AI kurulumu"""
+        """Gemini AI setup with error handling"""
         if not AI_AVAILABLE:
-            logger.warning("Gemini AI not available")
+            logger.warning("Gemini AI libraries not available")
             return
             
         try:
@@ -125,19 +162,30 @@ class CarDealerBot:
             if api_key:
                 genai.configure(api_key=api_key)
                 self.gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
-                logger.info("Gemini AI initialized")
+                logger.info("Gemini AI initialized successfully")
             else:
-                logger.warning("Gemini API key not found")
+                logger.info("Gemini API key not provided - feature disabled")
         except Exception as e:
             logger.error(f"Gemini AI setup failed: {e}")
+            self.gemini_model = None
+
+    def cleanup_chat_sessions(self):
+        """Prevent memory leak by limiting chat sessions"""
+        if len(self.chat_sessions) > self.max_sessions:
+            # Remove oldest sessions
+            sessions_to_remove = len(self.chat_sessions) - self.max_sessions
+            oldest_keys = list(self.chat_sessions.keys())[:sessions_to_remove]
+            for key in oldest_keys:
+                del self.chat_sessions[key]
+            logger.info(f"Cleaned up {sessions_to_remove} chat sessions")
 
     # === FINANCIAL FUNCTIONS ===
     
     def detect_financial_intent(self, text):
-        """Finansal işlem tipini tespit et"""
+        """Detect financial transaction from text"""
         text_lower = text.lower()
         
-        # Para miktarı tespiti
+        # Extract amount
         amount_match = re.search(r'(\d+(?:[.,]\d+)?)\s*tl', text_lower)
         if not amount_match:
             return None
@@ -146,10 +194,10 @@ class CarDealerBot:
             amount = float(amount_match.group(1).replace(',', '.'))
             if amount <= 0:
                 return None
-        except:
+        except (ValueError, TypeError):
             return None
         
-        # İşlem tipi tespiti
+        # Determine transaction type
         income_keywords = ['kazandım', 'sattım', 'gelir', 'komisyon', 'ödeme aldım', 'satış yaptım']
         expense_keywords = ['harcadım', 'ödedim', 'aldım', 'masraf', 'gider', 'fatura', 'para harcadım']
         
@@ -167,17 +215,17 @@ class CarDealerBot:
             else:
                 transaction_type = 'gider'
         
-        # Hesap tipi tespiti
+        # Determine account type
         account_type = 'kisisel'  # default
         if any(word in text_lower for word in ['araba', 'araç', 'galeri', 'civic', 'bmw', 'mercedes', 'toyota', 'honda']):
             account_type = 'araba'
         elif any(word in text_lower for word in ['emlak', 'ev', 'daire', 'kiralama', 'satış komisyonu', 'gayrimenkul']):
             account_type = 'emlak'
         
-        # Kategori tespiti
+        # Determine category
         category = self.determine_category(text_lower, account_type, transaction_type)
         
-        # Açıklama çıkar
+        # Extract description
         description = re.sub(r'\d+(?:[.,]\d+)?\s*tl', '', text, flags=re.IGNORECASE).strip()
         description = re.sub(r'\s+', ' ', description)[:200]
         
@@ -190,7 +238,7 @@ class CarDealerBot:
         }
     
     def determine_category(self, text, account_type, transaction_type):
-        """Kategori belirle"""
+        """Determine transaction category"""
         categories = {
             'araba': {
                 'gelir': ['satış', 'servis', 'komisyon', 'diğer'],
@@ -206,7 +254,7 @@ class CarDealerBot:
             }
         }
         
-        available_categories = categories[account_type][transaction_type]
+        available_categories = categories.get(account_type, {}).get(transaction_type, ['diğer'])
         
         for category in available_categories:
             if category == 'diğer':
@@ -228,7 +276,7 @@ class CarDealerBot:
         return 'diğer'
 
     def add_transaction(self, user_id, transaction):
-        """Finansal işlem ekle"""
+        """Add financial transaction with error handling"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -243,38 +291,40 @@ class CarDealerBot:
                 transaction['amount'],
                 transaction['category'],
                 transaction['description'],
-                datetime.now().date().isoformat()
+                self.get_current_time().date().isoformat()
             ))
             
             conn.commit()
             conn.close()
             return True
+            
         except Exception as e:
             logger.error(f"Transaction add failed: {e}")
             return False
 
     def get_financial_summary(self, user_id, period='week', account_type=None):
-        """Finansal özet getir"""
+        """Get financial summary with error handling"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
             # Date filters
+            now = self.get_current_time()
             if period == 'day':
-                date_filter = datetime.now().date()
+                date_filter = now.date()
                 query_date = "date = ?"
             elif period == 'week':
-                date_filter = (datetime.now() - timedelta(days=7)).date()
+                date_filter = (now - timedelta(days=7)).date()
                 query_date = "date >= ?"
             elif period == 'month':
-                date_filter = datetime.now().replace(day=1).date()
+                date_filter = now.replace(day=1).date()
                 query_date = "date >= ?"
             else:  # year
-                date_filter = datetime.now().replace(month=1, day=1).date()
+                date_filter = now.replace(month=1, day=1).date()
                 query_date = "date >= ?"
             
             base_query = f"SELECT transaction_type, SUM(amount), category FROM transactions WHERE user_id = ? AND {query_date}"
-            params = [user_id, date_filter]
+            params = [user_id, date_filter.isoformat()]
             
             if account_type:
                 base_query += " AND account_type = ?"
@@ -287,7 +337,7 @@ class CarDealerBot:
             
             # Get totals
             total_query = f"SELECT transaction_type, SUM(amount) FROM transactions WHERE user_id = ? AND {query_date}"
-            total_params = [user_id, date_filter]
+            total_params = [user_id, date_filter.isoformat()]
             
             if account_type:
                 total_query += " AND account_type = ?"
@@ -299,7 +349,6 @@ class CarDealerBot:
             totals = cursor.fetchall()
             
             conn.close()
-            
             return results, totals
             
         except Exception as e:
@@ -307,7 +356,7 @@ class CarDealerBot:
             return [], []
 
     def format_financial_report(self, results, totals, period, account_type=None):
-        """Finansal rapor formatla"""
+        """Format financial report"""
         if not results and not totals:
             period_names = {'day': 'bugün', 'week': 'bu hafta', 'month': 'bu ay', 'year': 'bu yıl'}
             return f"📊 {period_names.get(period, period).title()} hiç işlem yok."
@@ -360,9 +409,8 @@ class CarDealerBot:
     # === CALENDAR FUNCTIONS ===
     
     def parse_time_from_text(self, text):
-        """Metinden zaman bilgisini çıkar"""
-        istanbul_tz = pytz.timezone('Europe/Istanbul')
-        now = datetime.now(istanbul_tz)
+        """Parse time from text with fallback for missing pytz"""
+        now = self.get_current_time()
         
         patterns = [
             (r'yarın\s+(?:saat\s+)?(\d{1,2}):(\d{2})', lambda h, m: (now + timedelta(days=1)).replace(hour=int(h), minute=int(m), second=0, microsecond=0)),
@@ -398,7 +446,7 @@ class CarDealerBot:
         return None, text, None
 
     def create_calendar_event(self, title, start_time, duration_minutes=30):
-        """Google Calendar etkinliği oluştur"""
+        """Create Google Calendar event with error handling"""
         if not self.calendar_service or not self.calendar_id:
             logger.error("Calendar service not available")
             return False
@@ -419,8 +467,7 @@ class CarDealerBot:
                 'reminders': {
                     'useDefault': False,
                     'overrides': [
-                        {'method': 'popup', 'minutes': 10},
-                        {'method': 'email', 'minutes': 30}
+                        {'method': 'popup', 'minutes': 10}
                     ]
                 }
             }
@@ -430,7 +477,7 @@ class CarDealerBot:
                 body=event
             ).execute()
             
-            logger.info(f"Calendar event created: {result['id']}")
+            logger.info(f"Calendar event created: {result.get('id', 'unknown')}")
             return True
             
         except Exception as e:
@@ -438,24 +485,28 @@ class CarDealerBot:
             return False
 
     def format_turkish_datetime(self, dt):
-        """Tarih-saat Türkçe formatla"""
-        months = {
-            1: 'Ocak', 2: 'Şubat', 3: 'Mart', 4: 'Nisan',
-            5: 'Mayıs', 6: 'Haziran', 7: 'Temmuz', 8: 'Ağustos',
-            9: 'Eylül', 10: 'Ekim', 11: 'Kasım', 12: 'Aralık'
-        }
-        
-        days = {
-            0: 'Pazartesi', 1: 'Salı', 2: 'Çarşamba', 3: 'Perşembe',
-            4: 'Cuma', 5: 'Cumartesi', 6: 'Pazar'
-        }
-        
-        return f"{dt.day} {months[dt.month]} {dt.year}, {days[dt.weekday()]}, {dt.strftime('%H:%M')}"
+        """Format datetime in Turkish with fallback"""
+        try:
+            months = {
+                1: 'Ocak', 2: 'Şubat', 3: 'Mart', 4: 'Nisan',
+                5: 'Mayıs', 6: 'Haziran', 7: 'Temmuz', 8: 'Ağustos',
+                9: 'Eylül', 10: 'Ekim', 11: 'Kasım', 12: 'Aralık'
+            }
+            
+            days = {
+                0: 'Pazartesi', 1: 'Salı', 2: 'Çarşamba', 3: 'Perşembe',
+                4: 'Cuma', 5: 'Cumartesi', 6: 'Pazar'
+            }
+            
+            return f"{dt.day} {months[dt.month]} {dt.year}, {days[dt.weekday()]}, {dt.strftime('%H:%M')}"
+        except Exception as e:
+            logger.error(f"Date formatting error: {e}")
+            return dt.strftime('%d.%m.%Y %H:%M')
 
     # === AI FUNCTIONS ===
     
     def is_car_related_question(self, text):
-        """Araba ile ilgili soru mu kontrol et"""
+        """Check if question is car-related"""
         car_keywords = [
             'araba', 'araç', 'otomobil', 'honda', 'toyota', 'bmw', 'mercedes',
             'civic', 'corolla', 'focus', 'golf', 'passat', 'a4', 'c180',
@@ -468,8 +519,8 @@ class CarDealerBot:
         text_lower = text.lower()
         return any(keyword in text_lower for keyword in car_keywords)
 
-    def get_car_expert_response(self, text):
-        """AI araba uzmanı yanıtı al"""
+    async def get_car_expert_response(self, text):
+        """Get AI car expert response with async support"""
         if not self.gemini_model:
             return "AI servis şu anda mevcut değil. Daha sonra tekrar deneyin."
         
@@ -489,7 +540,12 @@ class CarDealerBot:
             
             full_prompt = f"{system_prompt}\n\nKullanıcı sorusu: {text}"
             
-            response = self.gemini_model.generate_content(full_prompt)
+            # Use async generate if available, else sync
+            try:
+                response = await self.gemini_model.generate_content_async(full_prompt)
+            except:
+                response = self.gemini_model.generate_content(full_prompt)
+            
             return response.text
             
         except Exception as e:
@@ -499,7 +555,7 @@ class CarDealerBot:
     # === USER MANAGEMENT ===
     
     def is_user_onboarded(self, user_id):
-        """Kullanıcı onboarding tamamlamış mı"""
+        """Check if user completed onboarding"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -509,11 +565,12 @@ class CarDealerBot:
             conn.close()
             
             return result and result[0] == 1
-        except:
+        except Exception as e:
+            logger.error(f"User onboarding check failed: {e}")
             return False
 
     def mark_user_onboarded(self, user_id, username, first_name):
-        """Kullanıcıyı onboarded olarak işaretle"""
+        """Mark user as onboarded"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -521,7 +578,7 @@ class CarDealerBot:
             cursor.execute('''
                 INSERT OR REPLACE INTO users (id, username, first_name, onboarded)
                 VALUES (?, ?, ?, 1)
-            ''', (user_id, username, first_name))
+            ''', (user_id, username or '', first_name or ''))
             
             conn.commit()
             conn.close()
@@ -531,7 +588,7 @@ class CarDealerBot:
     # === INTENT DETECTION ===
     
     def detect_intent(self, text):
-        """Kullanıcı intent'ini tespit et"""
+        """Detect user intent"""
         text_lower = text.lower()
         
         # Financial transaction
@@ -572,7 +629,7 @@ class CarDealerBot:
     # === TELEGRAM HANDLERS ===
     
     async def show_onboarding(self, update: Update):
-        """Onboarding göster"""
+        """Show onboarding tutorial"""
         welcome_text = (
             "🚗 Araba Satış Asistanına Hoş Geldiniz!\n\n"
             "Ben sizin kişisel araba satış asistanınızım. 4 ana özelliğim var:\n\n"
@@ -600,7 +657,7 @@ class CarDealerBot:
         await update.message.reply_text(welcome_text, reply_markup=reply_markup)
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start komutu"""
+        """Handle /start command"""
         user = update.effective_user
         
         # Check onboarding
@@ -636,7 +693,7 @@ class CarDealerBot:
         )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Yardım komutu"""
+        """Handle help command"""
         help_text = (
             "🤖 Araba Satış Asistanı Yardım\n\n"
             "💰 FİNANSAL İŞLEMLER:\n"
@@ -660,105 +717,110 @@ class CarDealerBot:
         await update.message.reply_text(help_text)
 
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Button callback handler"""
+        """Handle button callbacks"""
         query = update.callback_query
         await query.answer()
         
-        user_id = query.from_user.id
-        
-        if query.data == "onboard_complete":
-            # Mark user as onboarded
-            user = query.from_user
-            self.mark_user_onboarded(user.id, user.username, user.first_name)
+        try:
+            user_id = query.from_user.id
             
-            # Show main menu
-            keyboard = [
-                [
-                    InlineKeyboardButton("💰 Mali Durum", callback_data="financial_summary"),
-                    InlineKeyboardButton("📊 Haftalık Rapor", callback_data="weekly_report")
-                ],
-                [
-                    InlineKeyboardButton("📅 Takvim", callback_data="calendar"),
-                    InlineKeyboardButton("🤖 Araba Uzmanı", callback_data="car_expert_info")
+            if query.data == "onboard_complete":
+                user = query.from_user
+                self.mark_user_onboarded(user.id, user.username, user.first_name)
+                
+                keyboard = [
+                    [
+                        InlineKeyboardButton("💰 Mali Durum", callback_data="financial_summary"),
+                        InlineKeyboardButton("📊 Haftalık Rapor", callback_data="weekly_report")
+                    ],
+                    [
+                        InlineKeyboardButton("📅 Takvim", callback_data="calendar"),
+                        InlineKeyboardButton("🤖 Araba Uzmanı", callback_data="car_expert_info")
+                    ]
                 ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await query.edit_message_text(
-                "🎉 Harika! Artık botu kullanmaya hazırsın.\n\n"
-                "Bana doğal dilde yazabilirsin:\n"
-                "• '500 TL yakıt aldım'\n"
-                "• 'Yarın 14:30'da randevu'\n"
-                "• '2018 Civic kaça satarım?'",
-                reply_markup=reply_markup
-            )
-            
-        elif query.data == "financial_summary":
-            results, totals = self.get_financial_summary(user_id, 'week')
-            report = self.format_financial_report(results, totals, 'week')
-            await query.edit_message_text(report)
-            
-        elif query.data == "weekly_report":
-            results, totals = self.get_financial_summary(user_id, 'week')
-            report = self.format_financial_report(results, totals, 'week')
-            await query.edit_message_text(report)
-            
-        elif query.data == "calendar":
-            calendar_url = f"https://calendar.google.com/calendar/u/0?cid={self.calendar_id}"
-            await query.edit_message_text(
-                f"📅 Takviminizi görüntülemek için tıklayın:\n{calendar_url}"
-            )
-            
-        elif query.data == "car_expert_info":
-            await query.edit_message_text(
-                "🤖 Araba Uzmanı Danışmanlık\n\n"
-                "Bana araba ile ilgili herhangi bir soru sorabilirsiniz:\n\n"
-                "• '2018 Civic ne kadara satarım?'\n"
-                "• 'Hangi markalar daha karlı?'\n"
-                "• 'BMW mu Mercedes mi tercih edilir?'\n"
-                "• 'Müşteri 300.000 TL teklif etti, kabul edeyim mi?'\n\n"
-                "Sorularınızı doğal dilde yazın!"
-            )
-            
-        elif query.data == "help":
-            help_text = (
-                "🤖 Hızlı Yardım\n\n"
-                "💰 Finansal: '500 TL benzin aldım'\n"
-                "📅 Randevu: 'Yarın 14:30'da toplantı'\n"
-                "🤖 Uzman: '2018 Civic ne kadar eder?'\n\n"
-                "Detaylı yardım: /yardim"
-            )
-            await query.edit_message_text(help_text)
-            
-        elif query.data == "tutorial":
-            await self.show_onboarding_from_callback(query)
-
-    async def show_onboarding_from_callback(self, query):
-        """Callback'ten onboarding göster"""
-        await query.edit_message_text(
-            "🚗 Araba Satış Asistanı Rehberi\n\n"
-            "TEMEL KULLANIM:\n\n"
-            "💰 Mali işlemler için:\n"
-            "• '350.000 TL Civic sattım'\n"
-            "• '500 TL yakıt aldım'\n"
-            "• '15.000 TL kira ödedim'\n\n"
-            "📅 Randevular için:\n"
-            "• 'Yarın 14:30'da müşteri randevusu'\n"
-            "• 'Bugün 16:00'da test sürüşü'\n\n"
-            "🤖 Araba soruları için:\n"
-            "• '2018 Civic ne kadar eder?'\n"
-            "• 'Hangi marka daha karlı?'\n\n"
-            "📊 Raporlar için:\n"
-            "• 'Bu hafta ne kadar kazandım?'\n"
-            "• 'Bu ay durum nasıl?'\n\n"
-            "💡 Komut yazmaya gerek yok!"
-        )
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await query.edit_message_text(
+                    "🎉 Harika! Artık botu kullanmaya hazırsın.\n\n"
+                    "Bana doğal dilde yazabilirsin:\n"
+                    "• '500 TL yakıt aldım'\n"
+                    "• 'Yarın 14:30'da randevu'\n"
+                    "• '2018 Civic kaça satarım?'",
+                    reply_markup=reply_markup
+                )
+                
+            elif query.data == "financial_summary":
+                results, totals = self.get_financial_summary(user_id, 'week')
+                report = self.format_financial_report(results, totals, 'week')
+                await query.edit_message_text(report)
+                
+            elif query.data == "weekly_report":
+                results, totals = self.get_financial_summary(user_id, 'week')
+                report = self.format_financial_report(results, totals, 'week')
+                await query.edit_message_text(report)
+                
+            elif query.data == "calendar":
+                if self.calendar_id:
+                    calendar_url = f"https://calendar.google.com/calendar/u/0?cid={self.calendar_id}"
+                    await query.edit_message_text(
+                        f"📅 Takviminizi görüntülemek için tıklayın:\n{calendar_url}"
+                    )
+                else:
+                    await query.edit_message_text("📅 Takvim servisi şu anda mevcut değil.")
+                
+            elif query.data == "car_expert_info":
+                await query.edit_message_text(
+                    "🤖 Araba Uzmanı Danışmanlık\n\n"
+                    "Bana araba ile ilgili herhangi bir soru sorabilirsiniz:\n\n"
+                    "• '2018 Civic ne kadara satarım?'\n"
+                    "• 'Hangi markalar daha karlı?'\n"
+                    "• 'BMW mu Mercedes mi tercih edilir?'\n"
+                    "• 'Müşteri 300.000 TL teklif etti, kabul edeyim mi?'\n\n"
+                    "Sorularınızı doğal dilde yazın!"
+                )
+                
+            elif query.data == "help":
+                help_text = (
+                    "🤖 Hızlı Yardım\n\n"
+                    "💰 Finansal: '500 TL benzin aldım'\n"
+                    "📅 Randevu: 'Yarın 14:30'da toplantı'\n"
+                    "🤖 Uzman: '2018 Civic ne kadar eder?'\n\n"
+                    "Detaylı yardım: /yardim"
+                )
+                await query.edit_message_text(help_text)
+                
+            elif query.data == "tutorial":
+                await query.edit_message_text(
+                    "🚗 Araba Satış Asistanı Rehberi\n\n"
+                    "TEMEL KULLANIM:\n\n"
+                    "💰 Mali işlemler için:\n"
+                    "• '350.000 TL Civic sattım'\n"
+                    "• '500 TL yakıt aldım'\n"
+                    "• '15.000 TL kira ödedim'\n\n"
+                    "📅 Randevular için:\n"
+                    "• 'Yarın 14:30'da müşteri randevusu'\n"
+                    "• 'Bugün 16:00'da test sürüşü'\n\n"
+                    "🤖 Araba soruları için:\n"
+                    "• '2018 Civic ne kadar eder?'\n"
+                    "• 'Hangi marka daha karlı?'\n\n"
+                    "📊 Raporlar için:\n"
+                    "• 'Bu hafta ne kadar kazandım?'\n"
+                    "• 'Bu ay durum nasıl?'\n\n"
+                    "💡 Komut yazmaya gerek yok!"
+                )
+                
+        except Exception as e:
+            logger.error(f"Button callback error: {e}")
+            await query.edit_message_text("❌ Bir hata oluştu. Lütfen tekrar deneyin.")
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Ana mesaj handler"""
+        """Main message handler with error handling"""
         try:
             user_id = update.effective_user.id
             text = update.message.text
+            
+            if not text or len(text.strip()) == 0:
+                return
             
             # Check onboarding
             if not self.is_user_onboarded(user_id):
@@ -799,7 +861,7 @@ class CarDealerBot:
             )
 
     async def handle_financial_transaction(self, update: Update, text: str):
-        """Finansal işlem ekle"""
+        """Handle financial transaction"""
         user_id = update.effective_user.id
         
         transaction = self.detect_financial_intent(text)
@@ -838,7 +900,7 @@ class CarDealerBot:
             await update.message.reply_text("❌ İşlem kaydedilemedi. Lütfen tekrar deneyin.")
 
     async def handle_financial_report(self, update: Update, text: str):
-        """Finansal rapor göster"""
+        """Handle financial report request"""
         user_id = update.effective_user.id
         text_lower = text.lower()
         
@@ -878,7 +940,7 @@ class CarDealerBot:
         await update.message.reply_text(report, reply_markup=reply_markup)
 
     async def handle_reminder(self, update: Update, text: str):
-        """Hatırlatıcı oluştur"""
+        """Handle reminder creation"""
         parsed_time, message, time_expr = self.parse_time_from_text(text)
         
         if not parsed_time:
@@ -926,8 +988,8 @@ class CarDealerBot:
             )
 
     async def handle_car_expert(self, update: Update, text: str):
-        """Araba uzmanı danışmanlığı"""
-        response = self.get_car_expert_response(text)
+        """Handle car expert consultation"""
+        response = await self.get_car_expert_response(text)
         
         keyboard = [
             [InlineKeyboardButton("🤖 Başka Soru Sor", callback_data="car_expert_info")]
@@ -937,26 +999,24 @@ class CarDealerBot:
         await update.message.reply_text(response, reply_markup=reply_markup)
 
     async def handle_calendar_request(self, update: Update):
-        """Takvim isteği"""
+        """Handle calendar request"""
         if self.calendar_id:
             calendar_url = f"https://calendar.google.com/calendar/u/0?cid={self.calendar_id}"
             await update.message.reply_text(
                 f"📅 Takviminizi görüntülemek için tıklayın:\n{calendar_url}"
             )
         else:
-            await update.message.reply_text(
-                "📅 Takvim servisi şu anda mevcut değil."
-            )
+            await update.message.reply_text("📅 Takvim servisi şu anda mevcut değil.")
 
     async def handle_reset_chat(self, update: Update):
-        """Sohbet sıfırlama"""
+        """Handle chat reset"""
         user_id = update.effective_user.id
         if user_id in self.chat_sessions:
             del self.chat_sessions[user_id]
         await update.message.reply_text("🤖 Sohbet geçmişi temizlendi!")
 
     async def handle_general_chat(self, update: Update, text: str):
-        """Genel sohbet"""
+        """Handle general chat with AI"""
         user_id = update.effective_user.id
         
         if not self.gemini_model:
@@ -969,13 +1029,26 @@ class CarDealerBot:
             )
             return
         
+        # Cleanup sessions if needed
+        self.cleanup_chat_sessions()
+        
         # Get or create chat session
         if user_id not in self.chat_sessions:
             self.chat_sessions[user_id] = self.gemini_model.start_chat()
         
         try:
+            # Use sync method as async might not be available
             response = self.chat_sessions[user_id].send_message(text)
-            await update.message.reply_text(response.text)
+            
+            # Split long responses
+            response_text = response.text
+            if len(response_text) > 4000:
+                chunks = [response_text[i:i+4000] for i in range(0, len(response_text), 4000)]
+                for chunk in chunks:
+                    await update.message.reply_text(chunk)
+            else:
+                await update.message.reply_text(response_text)
+                
         except Exception as e:
             logger.error(f"Chat error: {e}")
             await update.message.reply_text(
@@ -987,46 +1060,58 @@ class CarDealerBot:
         logger.error(f"Update {update} caused error {context.error}")
 
 def main():
-    """Ana fonksiyon"""
-    bot = CarDealerBot()
-    
-    # Create application
-    application = Application.builder().token(bot.token).build()
-    
-    # Set bot commands
-    async def post_init(app):
-        await app.bot.set_my_commands([
-            BotCommand("start", "Botu başlatır"),
-            BotCommand("yardim", "Yardım menüsü")
-        ])
-    
-    application.post_init = post_init
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", bot.start_command))
-    application.add_handler(CommandHandler("yardim", bot.help_command))
-    application.add_handler(CommandHandler("help", bot.help_command))
-    
-    application.add_handler(CallbackQueryHandler(bot.button_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
-    
-    # Add error handler
-    application.add_error_handler(bot.error_handler)
-    
-    print("🚗 Araba Satış Asistanı v3.0 başlatılıyor...")
-    print("🤖 Bot hazır! Kullanıcılar /start ile başlayabilir.")
-    
-    # Features status
-    print(f"📊 Finansal takip: ✅ Aktif")
-    print(f"📅 Google Calendar: {'✅ Aktif' if bot.calendar_service else '⚠️ Pasif'}")
-    print(f"🤖 AI Uzman: {'✅ Aktif' if bot.gemini_model else '⚠️ Pasif'}")
-    
-    # Run bot
-    application.run_polling(
-        poll_interval=1,
-        timeout=10,
-        bootstrap_retries=5
-    )
+    """Main function"""
+    try:
+        bot = CarDealerBot()
+        
+        # Create application
+        application = Application.builder().token(bot.token).build()
+        
+        # Set bot commands
+        async def post_init(app):
+            try:
+                await app.bot.set_my_commands([
+                    BotCommand("start", "Botu başlatır"),
+                    BotCommand("yardim", "Yardım menüsü")
+                ])
+                logger.info("Bot commands set successfully")
+            except Exception as e:
+                logger.error(f"Failed to set bot commands: {e}")
+        
+        application.post_init = post_init
+        
+        # Add handlers
+        application.add_handler(CommandHandler("start", bot.start_command))
+        application.add_handler(CommandHandler("yardim", bot.help_command))
+        application.add_handler(CommandHandler("help", bot.help_command))
+        
+        application.add_handler(CallbackQueryHandler(bot.button_callback))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
+        
+        # Add error handler
+        application.add_error_handler(bot.error_handler)
+        
+        # Status messages
+        print("🚗 Araba Satış Asistanı v3.1 başlatılıyor...")
+        print("🤖 Bot hazır! Kullanıcılar /start ile başlayabilir.")
+        print()
+        print("📊 Özellik Durumu:")
+        print(f"  💰 Finansal takip: ✅ Aktif")
+        print(f"  📅 Google Calendar: {'✅ Aktif' if bot.calendar_service else '⚠️  Pasif (credentials gerekli)'}")
+        print(f"  🤖 AI Uzman: {'✅ Aktif' if bot.gemini_model else '⚠️  Pasif (API key gerekli)'}")
+        print(f"  🌐 Timezone: {'✅ pytz' if TIMEZONE_AVAILABLE else '⚠️  Fallback UTC+3'}")
+        print()
+        
+        # Run bot
+        application.run_polling(
+            poll_interval=1,
+            timeout=10,
+            bootstrap_retries=5
+        )
+        
+    except Exception as e:
+        logger.error(f"Bot startup failed: {e}")
+        print(f"❌ Bot başlatılamadı: {e}")
 
 if __name__ == "__main__":
     main()
